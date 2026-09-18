@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+aws-savings-report/
+.smoke-out/
+report.json
+report.md
+.env*
+.DS_Store

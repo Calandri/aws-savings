@@ -297,17 +297,21 @@ def check_cost_explorer(session, report: Report, days: int) -> None:
     if svc:
         cur: Dict[str, float] = defaultdict(float)
         prev: Dict[str, float] = defaultdict(float)
-        maxday: Dict[str, float] = defaultdict(float)
+        maxday_cur: Dict[str, float] = defaultdict(float)
+        maxday_prev: Dict[str, float] = defaultdict(float)
         for r in svc:
             if r["period"] >= s7.isoformat():
                 cur[r["key"]] += r["cost"]
-                maxday[r["key"]] = max(maxday[r["key"]], r["cost"])
+                maxday_cur[r["key"]] = max(maxday_cur[r["key"]], r["cost"])
             else:
                 prev[r["key"]] += r["cost"]
+                maxday_prev[r["key"]] = max(maxday_prev[r["key"]], r["cost"])
         table = []
         for k in sorted(set(cur) | set(prev), key=lambda x: -cur.get(x, 0)):
             c, p = cur.get(k, 0.0), prev.get(k, 0.0)
-            monthly = c > 0 and maxday[k] > 0.6 * c
+            # A service where one day carries most of a week is billed monthly (Route 53 zones, RI fees that
+            # slipped through, licences): its week-over-week delta is noise, so it is flagged instead.
+            monthly = (c > 1 and maxday_cur[k] > 0.6 * c) or (p > 1 and maxday_prev[k] > 0.6 * p)
             delta = None if (p == 0 or monthly) else round((c - p) / p * 100, 1)
             table.append({"service": k, "last7_usd": round(c, 2), "prev7_usd": round(p, 2),
                           "delta_pct": delta, "monthly_cadence": monthly})

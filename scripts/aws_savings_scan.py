@@ -788,7 +788,16 @@ def check_ec2_ebs(session, report: Report, region: str, days: int) -> None:
         vols[v["VolumeId"]] = v
     used_amis = {i.get("ImageId") for i in instances}
 
-    ri_types = {c.get("type") for c in report.inventory.get("global", {}).get("commitments_calendar", []) if c.get("kind") == "EC2-RI"}
+    # Reserved count per instance type in this region: an instance is "covered" only if the reservations of its
+    # type are enough for every running instance of that type (one RI does not cover two t2.micro).
+    ri_count: Dict[str, int] = defaultdict(int)
+    for c in report.inventory.get("global", {}).get("commitments_calendar", []):
+        if c.get("kind") == "EC2-RI" and c.get("region") == region:
+            ri_count[c.get("type")] += int(c.get("count") or 1)
+    running_by_type: Dict[str, int] = defaultdict(int)
+    for i in instances:
+        if i.get("State", {}).get("Name") == "running":
+            running_by_type[i.get("InstanceType")] += 1
     running, stopped = [], []
     for i in instances:
         name = next((t["Value"] for t in i.get("Tags", []) if t["Key"] == "Name"), "")
@@ -804,7 +813,7 @@ def check_ec2_ebs(session, report: Report, region: str, days: int) -> None:
             row.update({"cpu_avg_pct": round(avg, 2) if avg is not None else None, "cpu_max_pct": round(mx, 2) if mx is not None else None})
             running.append(row)
             if avg is not None and mx is not None and avg < 5 and mx < 40:
-                on_ri = i.get("InstanceType") in ri_types
+                on_ri = ri_count.get(i.get("InstanceType"), 0) >= running_by_type.get(i.get("InstanceType"), 0)
                 report.add("ec2.underused", "compute", region, f"{i['InstanceId']} {name} ({i.get('InstanceType')})",
                            f"CPU avg {avg:.1f}% / max {mx:.1f}% over {days} days. Candidate for a smaller type or a schedule. "
                            "Check memory and p99 first (a bursty box with high max is NOT a candidate); check tags for grants/contracts."

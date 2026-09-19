@@ -332,14 +332,25 @@ def check_cost_explorer(session, report: Report, days: int) -> None:
             agg[r["key"]] += r["cost"]
         inv["region_7d"] = [{"region": k, "usd": round(v, 2)} for k, v in sorted(agg.items(), key=lambda x: -x[1])]
 
-    # 4. Per usage type, last 7 days: cost + quantity -> unit price from the bill.
-    ut = safe(report, "ce.by_usage_type", "global", ce_cost, ce, report, s7, TODAY, "MONTHLY", "USAGE_TYPE", USAGE_ONLY)
+    # 4. Per usage type, 14 days daily: cost + quantity -> unit price from the bill, and the week-over-week movers.
+    ut = safe(report, "ce.by_usage_type", "global", ce_cost, ce, report, s14, TODAY, "DAILY", "USAGE_TYPE", USAGE_ONLY)
     if ut:
         agg_c: Dict[str, float] = defaultdict(float)
         agg_q: Dict[str, float] = defaultdict(float)
+        prev_c: Dict[str, float] = defaultdict(float)
         for r in ut:
-            agg_c[r["key"]] += r["cost"]
-            agg_q[r["key"]] += r["qty"]
+            if r["period"] >= s7.isoformat():
+                agg_c[r["key"]] += r["cost"]
+                agg_q[r["key"]] += r["qty"]
+            else:
+                prev_c[r["key"]] += r["cost"]
+        movers = []
+        for k in set(agg_c) | set(prev_c):
+            c, p = agg_c.get(k, 0.0), prev_c.get(k, 0.0)
+            if abs(c - p) >= 3 and max(c, p) >= 5:
+                movers.append({"usage_type": k, "last7_usd": round(c, 2), "prev7_usd": round(p, 2), "delta_usd": round(c - p, 2)})
+        movers.sort(key=lambda m: -abs(m["delta_usd"]))
+        inv["usage_type_movers"] = movers[:20]
         top = sorted(agg_c.items(), key=lambda x: -x[1])[:80]
         inv["usage_type_7d"] = [{"usage_type": k, "usd": round(v, 2), "qty": round(agg_q[k], 3)} for k, v in top]
         for k, c in agg_c.items():
@@ -1165,12 +1176,17 @@ def check_rds(session, report: Report, region: str, days: int) -> None:
                        do=f"aws rds modify-db-cluster --db-cluster-identifier {cid} --storage-type aurora --apply-immediately",
                        undo=f"--storage-type aurora-iopt1 (only after 30 days)")
         if s2 and (s2.get("MinCapacity") or 0) == 0:
-            acu_min = safe(report, "aurora.acu", region, metric_stat, cw, "AWS/RDS", "ServerlessDatabaseCapacity", {"DBClusterIdentifier": cid}, days, "Minimum")
-            if acu_min is not None and acu_min > 0:
+            acu_avg = safe(report, "aurora.acu", region, metric_stat, cw, "AWS/RDS", "ServerlessDatabaseCapacity", {"DBClusterIdentifier": cid}, days, "Average")
+            acu_max = safe(report, "aurora.acu", region, metric_stat, cw, "AWS/RDS", "ServerlessDatabaseCapacity", {"DBClusterIdentifier": cid}, days, "Maximum")
+            row["acu_avg"], row["acu_max"] = acu_avg, acu_max
+            # The minimum is useless here: it touches 0 for a minute during a scale event. The average tells the story:
+            # 0.48 over two weeks on a 0.5 ACU floor means the database sleeps 4% of the time.
+            if acu_avg is not None and acu_avg >= 0.3 and (acu_max or 0) <= 2 * max(acu_avg, 0.5):
                 report.add("aurora.serverless_never_sleeps", "rds", region, cid,
-                           f"Serverless v2 with min 0 ACU never went below {acu_min} ACU in {days} days: something keeps a connection open (pool, monitor, cron). "
-                           "Find that client and give it a timeout; the DB then scales to zero when idle (first query after a pause takes ~15 s).",
-                           row, est_month=acu_min * 0.12 * HOURS_MONTH, basis="list", tier="C")
+                           f"Serverless v2 with min 0 ACU averaged {acu_avg:.2f} ACU over {days} days (max {acu_max}): it sits on its 0.5 ACU floor almost all the time. "
+                           "Something keeps a connection open (pool, monitor, cron). Find that client and give it a timeout; the DB then scales to zero when idle "
+                           "(first query after a pause takes ~15 s).",
+                           row, est_month=acu_avg * 0.12 * HOURS_MONTH, basis="list", tier="C")
         elif s2 and (s2.get("MinCapacity") or 0) > 0:
             conn = max((m.get("conn_max") or 0) for m in rows if m["id"] in row["members"]) if row["members"] else None
             if conn == 0:
@@ -1690,6 +1706,12 @@ def render_markdown(report: Report, meta: Dict[str, Any]) -> str:
             L.append("")
         if ce.get("region_7d"):
             L.append("Regions (last 7 days): " + ", ".join(f"{r['region']} ${r['usd']:.0f}" for r in ce["region_7d"][:12]) + "\n")
+        if ce.get("usage_type_movers"):
+            L.append("What moved, by usage type (last 7 days vs the 7 before; the line that explains a service's jump):\n")
+            L.append("| usage type | last 7d | prev 7d | Δ $ |\n|---|---:|---:|---:|")
+            for m in ce["usage_type_movers"][:15]:
+                L.append(f"| {m['usage_type']} | {m['last7_usd']:.2f} | {m['prev7_usd']:.2f} | {m['delta_usd']:+.2f} |")
+            L.append("")
         if ce.get("savings_plans_detail"):
             L.append("| Savings Plan | family | region | utilization | unused 14d | ends |\n|---|---|---|---:|---:|---|")
             for p in ce["savings_plans_detail"]:

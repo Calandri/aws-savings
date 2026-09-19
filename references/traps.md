@@ -40,6 +40,11 @@ Explorer *service* shows up in your own bill afterwards; that is you.
 off and they will recommend commitments sized on what no longer exists. Wait 30 days after
 the cuts settle. Prefer 1-year terms.
 
+**A drop is a one-off as often as a spike is.** Lambda GB-seconds halving week over week looked
+like a cut; it was the end of a bulk import that had inflated the previous week. Before crediting
+a saving to a change, find the usage-type line that moved and check both weeks were normal.
+The "what moved by usage type" table in the scanner report is the first thing to read.
+
 **Cost Explorer rewrites closed days** when the month consolidates (credits, refunds,
 reclassifications). If you store daily numbers, re-read the last 14 days each time.
 

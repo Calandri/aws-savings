@@ -19,6 +19,7 @@ The "proof" and "trap" columns are what you still have to think about.
 | Per service, 7d vs previous 7d | same, `--group-by Type=DIMENSION,Key=SERVICE`, windows ending yesterday | what moved; flag "monthly cadence" where one day > 60% of the week |
 | Per region | `--group-by Type=DIMENSION,Key=REGION` | regions that should be empty and are not |
 | Per usage type (the unit prices) | `--group-by Type=DIMENSION,Key=USAGE_TYPE --metrics UnblendedCost UsageQuantity` | cost ÷ quantity = the price you actually pay (NAT/h, EIP/h, GB-month, GB-s) |
+| What moved, by usage type | same, 14 days DAILY, sum each week, sort by absolute delta | the one line that explains a service's jump (an egress burst, a tiering transition, a storage-type switch, a bulk job ending) |
 | Anomalies | `$A ce get-anomalies --date-interval Start=<t-30d>,End=<t-1d>` (End must be yesterday) | root cause by service/region/usage type |
 | Attribute a Lambda spike to a function | CloudWatch `Duration` Sum per function (period 86400) × `MemorySize/1024`, rank by day-over-day delta | Cost Explorer stops at the service |
 | Forecast of the remaining month | `get-cost-forecast --granularity DAILY` and sum; `MONTHLY` on a partial period returns the whole month | |

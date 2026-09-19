@@ -217,6 +217,25 @@ def metric_data_batch(cw, queries: List[Dict[str, Any]], start: dt.datetime, end
     return out
 
 
+def metric_data_batch_ts(cw, queries: List[Dict[str, Any]], start: dt.datetime, end: dt.datetime) -> Dict[str, List[tuple]]:
+    """Like metric_data_batch but returns {id: [(timestamp, value), ...]} so series can be aligned by day."""
+    out: Dict[str, List[tuple]] = {}
+    for i in range(0, len(queries), 500):
+        batch = queries[i:i + 500]
+        token = None
+        while True:
+            kw = dict(MetricDataQueries=batch, StartTime=start, EndTime=end, ScanBy="TimestampDescending")
+            if token:
+                kw["NextToken"] = token
+            r = cw.get_metric_data(**kw)
+            for res in r.get("MetricDataResults", []):
+                out.setdefault(res["Id"], []).extend(zip(res.get("Timestamps", []), res.get("Values", [])))
+            token = r.get("NextToken")
+            if not token:
+                break
+    return out
+
+
 def q(id_: str, ns: str, name: str, dims: Dict[str, str], period: int, stat: str) -> Dict[str, Any]:
     return {"Id": id_, "ReturnData": True,
             "MetricStat": {"Metric": {"Namespace": ns, "MetricName": name,
@@ -1469,8 +1488,11 @@ def check_s3(session, report: Report, regions: List[str], workers: int) -> None:
         by_region[reg].append(name)
 
     # Sizes and object counts from the free daily CloudWatch metrics, now and ~90 days ago.
+    # Storage classes appear and disappear over time (a lifecycle rule moves everything to Intelligent-Tiering
+    # on one day): growth is computed on the per-day TOTAL across classes, never per class.
     size_now: Dict[str, Dict[str, float]] = defaultdict(dict)
     size_old: Dict[str, Dict[str, float]] = defaultdict(dict)
+    daily_total: Dict[str, Dict[Any, float]] = defaultdict(lambda: defaultdict(float))
     objs_now: Dict[str, float] = {}
     objs_old: Dict[str, float] = {}
     start = NOW - dt.timedelta(days=92)
@@ -1494,29 +1516,40 @@ def check_s3(session, report: Report, regions: List[str], workers: int) -> None:
             idmap[qid] = (b, "objects")
             queries.append(q(qid, "AWS/S3", "NumberOfObjects", {"BucketName": b, "StorageType": "AllStorageTypes"}, 86400, "Average"))
             n += 1
-        data = safe(report, "s3.metrics", reg, metric_data_batch, cw, queries, start, NOW) or {}
-        for qid, vals in data.items():
-            if not vals:
+        data = safe(report, "s3.metrics", reg, metric_data_batch_ts, cw, queries, start, NOW) or {}
+        for qid, pairs in data.items():
+            if not pairs:
                 continue
             b, st = idmap[qid]
+            vals = [v for _, v in pairs]
             if st == "objects":
                 objs_now[b], objs_old[b] = vals[0], vals[-1]
             else:
-                size_now[b][st], size_old[b][st] = vals[0], vals[-1]
+                size_now[b][st] = vals[0]
+                for ts, v in pairs:
+                    day = ts.date() if hasattr(ts, "date") else ts
+                    daily_total[b][day] += v
+    for b, days_map in daily_total.items():
+        if days_map:
+            first_day, last_day = min(days_map), max(days_map)
+            size_old[b] = {"_total": days_map[first_day]}
+            size_now[b]["_total"] = days_map[last_day]
 
     def per_bucket(name: str) -> Dict[str, Any]:
         reg = regions_of[name]
         row: Dict[str, Any] = {"bucket": name, "region": reg}
-        tot_now = sum(size_now.get(name, {}).values())
-        tot_old = sum(size_old.get(name, {}).values())
+        tot_now = size_now.get(name, {}).get("_total", sum(v for k, v in size_now.get(name, {}).items() if k != "_total"))
+        tot_old = size_old.get(name, {}).get("_total", 0.0)
         row["gb"] = gb(tot_now)
         row["gb_90d_ago"] = gb(tot_old)
         row["growth_gb_year"] = round((gb(tot_now) - gb(tot_old)) * 4, 1)
         row["objects"] = int(objs_now.get(name, 0))
         row["avg_object_kb"] = round(tot_now / objs_now[name] / 1024, 1) if objs_now.get(name) else None
-        row["classes"] = {st: gb(v) for st, v in size_now.get(name, {}).items() if v > 0}
+        row["classes"] = {st: gb(v) for st, v in size_now.get(name, {}).items() if v > 0 and st != "_total"}
         est = 0.0
         for st, v in size_now.get(name, {}).items():
+            if st == "_total":
+                continue
             est += gb(v) * LIST_PRICE["s3_gb_month"].get(st, 0.023 if "Overhead" not in st else 0.023)
         row["est_usd_month"] = round(est, 2)
         rules = None

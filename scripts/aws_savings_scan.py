@@ -36,7 +36,7 @@ from typing import Any, Dict, List, Optional
 try:
     import boto3
     from botocore.config import Config
-    from botocore.exceptions import BotoCoreError, ClientError, NoCredentialsError
+    from botocore.exceptions import BotoCoreError, ClientError, EndpointConnectionError, NoCredentialsError
 except ImportError:  # pragma: no cover
     print("boto3 is required: pip install boto3", file=sys.stderr)
     sys.exit(2)
@@ -148,9 +148,16 @@ def _short_err(err: Exception) -> str:
 
 
 def safe(report: Report, check: str, region: str, fn, *args, **kwargs):
-    """Run a check; on any AWS error record it as skipped instead of aborting the scan."""
+    """Run a check; on any AWS error record it as skipped instead of aborting the scan.
+    A transient connection error (DNS hiccup, reset) gets one retry after a short pause."""
     try:
         return fn(*args, **kwargs)
+    except EndpointConnectionError:
+        time.sleep(3)
+        try:
+            return fn(*args, **kwargs)
+        except (ClientError, BotoCoreError) as e:
+            report.skip(check, region, e)
     except (ClientError, BotoCoreError) as e:
         report.skip(check, region, e)
     except Exception as e:  # noqa: BLE001 - a bug in one check must not kill the whole scan
@@ -399,13 +406,22 @@ def check_cost_explorer(session, report: Report, days: int) -> None:
                            "ondemand_hours": float(ch.get("OnDemandHours", 0) or 0),
                            "reserved_hours": float(ch.get("ReservedHours", 0) or 0),
                            "ondemand_cost_14d": float(cc.get("OnDemandCost", 0) or 0)}
+                    if row["ondemand_cost_14d"] == 0 and row["ondemand_hours"] > 0:
+                        # CoverageCost.OnDemandCost is frequently 0: take the hourly price of that instance type from the bill.
+                        unit = next((v for k, v in report.unit_prices.items() if "InstanceUsage" in k and k.endswith(f":{itype}")), None)
+                        if unit is None:
+                            unit = next((v for k, v in report.unit_prices.items() if "BoxUsage" in k and k.endswith(f":{itype}")), None)
+                        if unit:
+                            row["ondemand_cost_14d"] = round(row["ondemand_hours"] * unit, 2)
+                            row["cost_basis"] = "hours x unit price from the bill"
                     cov_rows.append(row)
                     if row["ondemand_hours"] >= 300 and row["ondemand_cost_14d"] >= 20:
                         month = row["ondemand_cost_14d"] / 14 * 30
                         report.add("ce.ri_coverage_gap", "reservations", "global",
                                    f"{svc_name.split(' - ')[0]} {itype}",
                                    f"{row['ondemand_hours']:.0f} on-demand hours in 14 days ({row['coverage_pct']:.0f}% covered): "
-                                   f"${row['ondemand_cost_14d']:.0f}/14d at full price. A 1-year no-upfront reservation saves ~30%.",
+                                   f"${row['ondemand_cost_14d']:.0f}/14d at full price. A 1-year no-upfront reservation saves ~30%. "
+                                   "Check first that the instance is not about to be retired or converted (a serverless conversion makes the RI useless).",
                                    row, est_month=month * 0.30, basis="bill", tier="B",
                                    do="Purchase a 1-year no-upfront RI only for steady 24/7 load; never 3 years on something you may retire.",
                                    undo="None: a reservation cannot be cancelled.")
@@ -761,6 +777,7 @@ def check_ec2_ebs(session, report: Report, region: str, days: int) -> None:
         vols[v["VolumeId"]] = v
     used_amis = {i.get("ImageId") for i in instances}
 
+    ri_types = {c.get("type") for c in report.inventory.get("global", {}).get("commitments_calendar", []) if c.get("kind") == "EC2-RI"}
     running, stopped = [], []
     for i in instances:
         name = next((t["Value"] for t in i.get("Tags", []) if t["Key"] == "Name"), "")
@@ -776,10 +793,12 @@ def check_ec2_ebs(session, report: Report, region: str, days: int) -> None:
             row.update({"cpu_avg_pct": round(avg, 2) if avg is not None else None, "cpu_max_pct": round(mx, 2) if mx is not None else None})
             running.append(row)
             if avg is not None and mx is not None and avg < 5 and mx < 40:
+                on_ri = i.get("InstanceType") in ri_types
                 report.add("ec2.underused", "compute", region, f"{i['InstanceId']} {name} ({i.get('InstanceType')})",
                            f"CPU avg {avg:.1f}% / max {mx:.1f}% over {days} days. Candidate for a smaller type or a schedule. "
-                           "Check memory and p99 first (a bursty box with high max is NOT a candidate); check tags for grants/contracts.",
-                           row, tier="B",
+                           "Check memory and p99 first (a bursty box with high max is NOT a candidate); check tags for grants/contracts."
+                           + (" An active EC2 reservation covers this instance type: resizing or stopping it refunds nothing until the RI ends; decide at renewal." if on_ri else ""),
+                           row, tier="X" if on_ri else "B",
                            do=f"aws ec2 stop-instances --instance-ids {i['InstanceId']} ; aws ec2 modify-instance-attribute --instance-id {i['InstanceId']} --instance-type <smaller> ; aws ec2 start-instances --instance-ids {i['InstanceId']}",
                            undo="Same sequence with the original type")
             if not name:
@@ -950,7 +969,8 @@ def check_lambda(session, report: Report, region: str, days: int, deep: bool, wo
     if timeouts:
         for name, inv, dur, tmo, mem in timeouts:
             report.add("lambda.timing_out", "lambda", region, name,
-                       f"Average duration {dur / 1000:.0f}s against a {tmo / 1000:.0f}s timeout, max hits the ceiling: it pays full price and delivers nothing. "
+                       f"Average duration {dur / 1000:.0f}s against a {tmo / 1000:.0f}s timeout, max hits the ceiling: it pays full price and delivers nothing, "
+                       "unless it is a time-boxed batch that resumes where it stopped (check the code and the Errors metric). "
                        f"At {mem} MB it has ~{mem / 1769:.1f} vCPU; more memory often means SAME cost and a function that works.",
                        {"invocations": inv, "avg_ms": dur, "timeout_ms": tmo, "memory_mb": mem}, tier="A",
                        do=f"aws lambda update-function-configuration --function-name {name} --memory-size <2-4x>",
@@ -1313,13 +1333,6 @@ def check_containers(session, report: Report, region: str, days: int) -> None:
 def check_observability_misc(session, report: Report, region: str, days: int) -> None:
     cw = session.client("cloudwatch", region_name=region, config=BOTO_CFG)
     try:
-        dash = list(_paginate(cw, "list_dashboards", "DashboardEntries"))
-        if len(dash) > 3:
-            report.add("cw.dashboards", "cloudwatch", region, f"{len(dash)} dashboards",
-                       f"First 3 dashboards are free, then $3/month each. Names: {', '.join(d['DashboardName'] for d in dash[:10])}. Save the body JSON before deleting.",
-                       {"names": [d["DashboardName"] for d in dash]}, est_month=(len(dash) - 3) * LIST_PRICE["cw_dashboard_month"], basis="list", tier="A",
-                       do="aws cloudwatch get-dashboard --dashboard-name <n> --query DashboardBody --output text > n.json ; aws cloudwatch delete-dashboards --dashboard-names <n>",
-                       undo="put-dashboard --dashboard-body file://n.json")
         alarms = list(_paginate(cw, "describe_alarms", "MetricAlarms", StateValue="ALARM"))
         stuck = [a for a in alarms if (age_days(a.get("StateUpdatedTimestamp")) or 0) > 7]
         if stuck:
@@ -1402,10 +1415,15 @@ def check_observability_misc(session, report: Report, region: str, days: int) ->
 # S3 (global bucket list, metrics in each bucket's region)
 # ---------------------------------------------------------------------------
 def bucket_region(s3, name: str) -> str:
-    try:
-        loc = s3.get_bucket_location(Bucket=name).get("LocationConstraint")
-    except ClientError:
-        return "unknown"
+    loc = None
+    for attempt in range(3):
+        try:
+            loc = s3.get_bucket_location(Bucket=name).get("LocationConstraint")
+            break
+        except (ClientError, BotoCoreError):
+            if attempt == 2:
+                return "unknown"
+            time.sleep(1 + attempt)
     if loc is None:
         return "us-east-1"
     if loc == "EU":
@@ -1514,8 +1532,18 @@ def check_s3(session, report: Report, regions: List[str], workers: int) -> None:
             row["open_multipart_uploads"] = None
         return row
 
+    def per_bucket_safe(name: str) -> Optional[Dict[str, Any]]:
+        for attempt in range(3):
+            try:
+                return per_bucket(name)
+            except (ClientError, BotoCoreError) as e:
+                if attempt == 2:
+                    report.skip(f"s3.bucket[{name}]", regions_of.get(name, "?"), e)
+                time.sleep(1 + attempt)
+        return None
+
     with cf.ThreadPoolExecutor(max_workers=workers) as ex:
-        rows = list(ex.map(per_bucket, [b["Name"] for b in buckets]))
+        rows = [r for r in ex.map(per_bucket_safe, [b["Name"] for b in buckets]) if r]
     rows.sort(key=lambda r: -r["gb"])
     report.inv("global", "s3", {"buckets": len(rows), "total_gb": round(sum(r["gb"] for r in rows), 1),
                                 "est_usd_month": round(sum(r["est_usd_month"] for r in rows), 2),
@@ -1572,6 +1600,19 @@ def check_s3(session, report: Report, regions: List[str], workers: int) -> None:
 
 
 def check_global_edge(session, report: Report) -> None:
+    # CloudWatch dashboards are account-wide (the same list from every region): count them once.
+    try:
+        cw = session.client("cloudwatch", region_name="us-east-1", config=BOTO_CFG)
+        dash = list(_paginate(cw, "list_dashboards", "DashboardEntries"))
+        report.inv("global", "cloudwatch_dashboards", [d["DashboardName"] for d in dash])
+        if len(dash) > 3:
+            report.add("cw.dashboards", "cloudwatch", "global", f"{len(dash)} dashboards",
+                       f"First 3 dashboards are free, then $3/month each. Names: {', '.join(d['DashboardName'] for d in dash[:12])}. Save the body JSON before deleting.",
+                       {"names": [d["DashboardName"] for d in dash]}, est_month=(len(dash) - 3) * LIST_PRICE["cw_dashboard_month"], basis="list", tier="A",
+                       do="aws cloudwatch get-dashboard --dashboard-name <n> --query DashboardBody --output text > n.json ; aws cloudwatch delete-dashboards --dashboard-names <n>",
+                       undo="put-dashboard --dashboard-body file://n.json")
+    except (ClientError, BotoCoreError) as e:
+        report.skip("cloudwatch.dashboards", "global", e)
     # CloudFront: disabled distributions that keep a WAF alive; WAF CLOUDFRONT scope.
     try:
         cf_ = session.client("cloudfront", region_name="us-east-1", config=BOTO_CFG)
@@ -1737,6 +1778,7 @@ def main() -> int:
     ap.add_argument("--skip-ce", action="store_true", help="Make no Cost Explorer calls (they cost $0.01 each)")
     ap.add_argument("--skip-s3", action="store_true", help="Skip the S3 inventory")
     ap.add_argument("--skip-lambda-deep", action="store_true", help="Skip per-function provisioned-concurrency lookups")
+    ap.add_argument("--skip-regions", action="store_true", help="Skip the per-region checks (run only Cost Explorer, commitments, edge and S3)")
     ap.add_argument("--workers", type=int, default=6, help="Parallelism for regions and per-resource calls")
     args = ap.parse_args()
 
@@ -1764,8 +1806,9 @@ def main() -> int:
         safe(report, "cost_explorer", "global", check_cost_explorer, session, report, args.days)
     safe(report, "commitments", "global", check_commitments_calendar, session, report, regions)
     safe(report, "edge", "global", check_global_edge, session, report)
-    with cf.ThreadPoolExecutor(max_workers=max(1, min(args.workers, len(regions)))) as ex:
-        list(ex.map(lambda r: scan_region(session, report, r, args.days, not args.skip_lambda_deep, args.workers), regions))
+    if not args.skip_regions:
+        with cf.ThreadPoolExecutor(max_workers=max(1, min(args.workers, len(regions)))) as ex:
+            list(ex.map(lambda r: scan_region(session, report, r, args.days, not args.skip_lambda_deep, args.workers), regions))
     if not args.skip_s3:
         safe(report, "s3", "global", check_s3, session, report, regions, args.workers)
 

@@ -242,7 +242,9 @@ def fake_handler(model, params, request_signer, context, **kwargs):
                 vals = [900000.0] if fn == "slow-comment" else [2000.0]
             elif qid.startswith("dur_"):
                 vals = [868000.0] if fn == "slow-comment" else [500.0]
-            results.append({"Id": qid, "Label": qid, "StatusCode": "Complete", "Timestamps": [NOW] * len(vals), "Values": vals})
+            # Newest first (ScanBy=TimestampDescending): today, then ~90 days ago, so growth has two distinct days.
+            stamps = [NOW - dt.timedelta(days=90 * i) for i in range(len(vals))]
+            results.append({"Id": qid, "Label": qid, "StatusCode": "Complete", "Timestamps": stamps, "Values": vals})
         return http, {"MetricDataResults": results, "Messages": []}
     if op == "GetLifecyclePolicy":
         if "nopolicy" in str(body):

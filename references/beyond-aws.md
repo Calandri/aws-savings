@@ -13,7 +13,7 @@ the bill, the resource, the proof it is unused.
   (low), "never born" (under 100 KB in its whole life, over 6 months old).
 - **Ask the account manager whether a "suspended" state at reduced fee exists** before
   deactivating anything: it turns an irreversible cut into a reversible one.
-- **Alarm on the prepaid balance.** Five weeks of autonomy and nobody watching is how 2,800
+- **Alarm on the prepaid balance.** Five weeks of autonomy and nobody watching is how thousands of
   devices go dark at once.
 - **Per-MB rates differ by carrier and country.** Audio-heavy devices (1.5 GB/month) belong on
   the cheapest per-MB carrier; 60 MB/month sensors on the cheapest per-SIM fee.
@@ -44,7 +44,7 @@ the bill, the resource, the proof it is unused.
 - **Stopped pods cost nothing; network volumes do.** Orphan volumes from finished training
   jobs, priced per GB-month.
 - **But do not delete the dataset volume that exists to avoid re-downloading from S3.** One
-  training session that re-fetched 1.6 TB from S3 cost 7× in egress what the GPU cost. Check
+  training session that re-fetched a terabyte-scale dataset from S3 cost 7× in egress what the GPU cost. Check
   the orchestration config actually mounts the volume (an empty `networkVolumeId` field re-
   downloads every time).
 - Idle timeout per worker: 60 s vs 5 s is a real line on a busy endpoint.

@@ -8,7 +8,7 @@ proposal list: every line with a price, the proof the resource is unused, the ri
 command to do it and the command to undo it. You decide.
 
 It was distilled from a six-month cost-cutting run on a real production account (about a
-thousand Lambda functions, 250 buckets, resources scattered over 18 regions). Roughly a third
+thousand Lambda functions, hundreds of buckets, resources scattered across many regions). Roughly a third
 of that bill was waste, and most of it was invisible from the console:
 
 - a NAT gateway up since 2019 for a Lambda that last ran in 2020

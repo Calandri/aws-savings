@@ -262,7 +262,7 @@ def fake_handler(model, params, request_signer, context, **kwargs):
 
 
 def main() -> int:
-    session = boto3.Session(aws_access_key_id="AKIAFAKEFAKEFAKEFAKE", aws_secret_access_key="fake", region_name="us-east-1")
+    session = boto3.Session(aws_access_key_id="FAKEACCESSKEYID", aws_secret_access_key="fake-secret-not-a-key", region_name="us-east-1")
     session._session.register("before-call.*.*", fake_handler)
     real_session_cls = boto3.Session
     boto3.Session = lambda *a, **k: session  # the scanner builds its own Session; hand it ours

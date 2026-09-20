@@ -11,7 +11,7 @@ every line has a price, the proof it is unused, a risk, the command to do it and
 to undo it. **You do not delete, stop, modify or purchase anything.** The account owner decides.
 
 This skill was distilled from a six-month cost-cutting run on a real production account
-(about a thousand Lambda functions, 250 buckets, resources in 18 regions). Roughly a third of
+(about a thousand Lambda functions, hundreds of buckets, resources scattered across many regions). Roughly a third of
 that bill was waste, and most of it was invisible from the console: resources that outlived what
 they served, fees billed per version, tiering that costs more than the storage it tiers. The
 method below is what found it; the traps are what would have found the wrong things.
@@ -140,7 +140,7 @@ API Gateway execution logging at INFO with data trace on 60 stages (also a secre
 Third-party serverless dashboards shipping a 1.6 KB payload per invocation.
 
 **Regions.** Run the same checks in every region: the leftovers live where nobody looks
-(a Shopify stack from 2021, two RDS micro in Paris, dev ECR repos in Virginia). GuardDuty in
+(an e-commerce stack from years ago in one region, two forgotten micro databases in another, dev container repos in a third). GuardDuty in
 empty regions is the one thing that would notice someone else using them: keep it.
 
 ## 5. Measurement traps (full list in references/traps.md)
